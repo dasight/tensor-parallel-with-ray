@@ -1,5 +1,6 @@
 R
 node_modules
+models
 *.pyc
 __pycache__
 .*

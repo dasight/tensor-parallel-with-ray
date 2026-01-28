@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from linear import RowParallelLinear, ColumnParallelLinear, AvgGrad
+torch.manual_seed(42)
 
 
 @dataclass
@@ -158,7 +159,24 @@ class LlamaAttention(nn.Module):
         q_embed = (q * cos) + (LlamaAttention.rotate_half(q) * sin)
         k_embed = (k * cos) + (LlamaAttention.rotate_half(k) * sin)
         return q_embed, k_embed
-    
+
+    def load(self, q_proj_w, k_proj_w, v_proj_w, o_proj_w):
+        if self.tp_size > 1:
+            start = self.hidden_size * self.tp_rank // self.tp_size
+            end = self.hidden_size * (self.tp_rank + 1) // self.tp_size
+            kv_start = self.kv_dim * self.tp_rank // self.tp_size
+            kv_end = self.kv_dim * (self.tp_rank + 1) // self.tp_size
+
+            self.q_proj.weight = nn.Parameter(q_proj_w[start:end, :])
+            self.k_proj.weight = nn.Parameter(k_proj_w[kv_start:kv_end, :])
+            self.v_proj.weight = nn.Parameter(v_proj_w[kv_start:kv_end, :])
+            self.o_proj.weight = nn.Parameter(o_proj_w[:, start:end])
+        else:
+            self.q_proj.weight = nn.Parameter(q_proj_w)
+            self.k_proj.weight = nn.Parameter(k_proj_w)
+            self.v_proj.weight = nn.Parameter(v_proj_w)
+            self.o_proj.weight = nn.Parameter(o_proj_w)
+
     def forward(self, x, pos_emb, mask=None) -> torch.Tensor:
         B, T, C = x.shape
         assert C == self.hidden_size
@@ -204,6 +222,9 @@ class LlamaMLP(nn.Module):
         tp_size: int = 1,
     ) -> None:
         super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.bias = bias
         self.tp_rank = tp_rank
         self.tp_size = tp_size
 
@@ -236,6 +257,17 @@ class LlamaMLP(nn.Module):
             )
             # self.act_fn = SiluAndMul()
 
+    def load(self, gate_proj_w, up_proj_w, down_proj_w):
+        if self.tp_size > 1:
+            start = self.intermediate_size * self.tp_rank // self.tp_size
+            end = self.intermediate_size * (self.tp_rank + 1) // self.tp_size
+            gate_up_w = torch.cat([gate_proj_w[start:end, :], up_proj_w[start:end, :]], dim=0)
+            self.gate_up_proj.weight = nn.Parameter(gate_up_w)
+            self.down_proj.weight = nn.Parameter(down_proj_w[:, start:end])
+        else:
+            self.gate_up_proj.weight = nn.Parameter(torch.cat([gate_proj_w, up_proj_w], dim=0))
+            self.down_proj.weight = nn.Parameter(down_proj_w)
+
     def forward(self, x):
         gate, x = self.gate_up_proj(x).chunk(2, dim=-1)
         x = F.silu(gate) * x
@@ -265,7 +297,7 @@ class LlamaRMSNorm(nn.Module):
 class LlamaDecoderLayer(nn.Module):
     '''Extending from GradientCheckpointingLayer in Huggingface's implemention'''
     
-    def __init__(self, config: LlamaConfig, layer_idx: int, tp_rank: int = -1, tp_size: int = 1):
+    def __init__(self, config: LlamaConfig, layer_idx: int, tp_rank: int, tp_size: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.tp_rank = tp_rank
@@ -289,6 +321,19 @@ class LlamaDecoderLayer(nn.Module):
         self.pre_attn_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_mlp_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def load(self, **kwargs):
+        self.attn.load(
+            kwargs['q_proj_w'],
+            kwargs['k_proj_w'],
+            kwargs['v_proj_w'],
+            kwargs['o_proj_w'],
+        )
+        self.mlp.load(
+            kwargs['gate_w'],
+            kwargs['up_w'],
+            kwargs['down_w'],
+        )
+
     def forward(
         self, x: torch.Tensor,
         pos_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
@@ -308,7 +353,7 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig, device='meta'):
+    def __init__(self, config: LlamaConfig, device='meta', tp_rank: int = -1, tp_size: int = 1):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -317,7 +362,8 @@ class LlamaModel(nn.Module):
         with torch.device(device):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
             self.layers = nn.ModuleList(
-                [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+                [LlamaDecoderLayer(config, layer_idx, tp_rank, tp_size) 
+                 for layer_idx in range(config.num_hidden_layers)]
             )
             self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -327,7 +373,7 @@ class LlamaModel(nn.Module):
     def forward(self, x, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.embed_tokens(x)
         B, T, _ = x.shape
-        pos_ids = torch.arange(T, dtype=torch.long).unsqueeze(0).expand(B, -1)
+        pos_ids = torch.arange(T, dtype=torch.long).unsqueeze(0).expand(B, -1).to(x.device)
         pos_emb = self.rotary_emb(x, pos_ids)
 
         for layer in self.layers:
@@ -345,148 +391,86 @@ def tp_attn(x, pos_emb, queue, qw, kw, vw, ow, gate_w, up_w, down_w, hidden_size
     dist.init_process_group(backend='gloo', init_method='env://', world_size=tp_size, rank=tp_rank)
     print(f"TP Rank {tp_rank} initialized.")
 
-    head_dim = hidden_size // num_query_heads
-    tp_q_dim = hidden_size // tp_size
-    tp_kv_dim = (head_dim * num_kv_heads) // tp_size
+    config = LlamaConfig()
     tp_dim = hidden_size // tp_size
-
-    # attn = LlamaAttention(
-    #     layer_idx=0,
-    #     hidden_size=hidden_size,
-    #     num_query_heads=num_query_heads,
-    #     num_kv_heads=num_kv_heads,
-    #     tp_rank=tp_rank,
-    #     tp_size=tp_size,
-    # )
-    # mlp = LlamaMLP(
-    #     hidden_size=hidden_size,
-    #     intermediate_size=hidden_size * 2,
-    #     tp_rank=tp_rank,
-    #     tp_size=tp_size,
-    # )
-
-    @dataclass
-    class TestConfig:
-        hidden_size: int = 16
-        vocab_size: int = 128256
-        num_hidden_layers: int = 16
-        num_attention_heads: int = 8
-        num_key_value_heads: int = 2
-        intermediate_size: int = 16
-        pad_token_id: int = None
-        max_position_embeddings: int = 131072
-        rope_theta: float = 500000.0
-        rope_scaling: dict = field(
-            default_factory=lambda: {
-                "factor": 32.0,
-                "high_freq_factor": 4.0,
-                "low_freq_factor": 1.0,
-                "original_max_position_embeddings": 8192,
-                "rope_type": "llama3"
-            }
-        )
-        # partial_rotary_factor: float = 1.0
-        rms_norm_eps: float = 1e-05
+    tp_int_dim = config.intermediate_size // tp_size
 
     layer = LlamaDecoderLayer(
-        config=TestConfig(),
+        config=config,
         layer_idx=0,
         tp_rank=tp_rank,
         tp_size=tp_size,
     )
-    
-    start, end = tp_rank * tp_q_dim, (tp_rank + 1) * tp_q_dim
-    layer.attn.q_proj.weight = nn.Parameter(qw[start:end, :])
-    layer.attn.o_proj.weight = nn.Parameter(ow[:, start:end])
-    start, end = tp_rank * tp_kv_dim, (tp_rank + 1) * tp_kv_dim
-    layer.attn.k_proj.weight = nn.Parameter(kw[start:end, :])
-    layer.attn.v_proj.weight = nn.Parameter(vw[start:end, :])
+    layer.load(
+        q_proj_w=qw,
+        k_proj_w=kw,
+        v_proj_w=vw,
+        o_proj_w=ow,
+        gate_w=gate_w,
+        up_w=up_w,
+        down_w=down_w,
+    )
 
-    start, end = tp_rank * tp_dim * 2, (tp_rank + 1) * tp_dim * 2
-    gate_w = gate_w[start:end, :]
-    up_w = up_w[start:end, :]
-    down_w = down_w[:, start:end]
-    gate_up_w = torch.cat([gate_w, up_w], dim=0)
-    layer.mlp.gate_up_proj.weight = nn.Parameter(gate_up_w)
-    layer.mlp.down_proj.weight = nn.Parameter(down_w)
-
+    y_attn = layer.attn(x, pos_emb)
     y_0 = layer(x, pos_emb)
     y = y_0.sum()
     y.backward()
     
+    y_attn_m = queue.get()
     y_0_m = queue.get()
-    q_grad_m = queue.get()[start:end, :]
+    start, end = tp_rank * tp_dim, (tp_rank + 1) * tp_dim
+    q_grad_m = queue.get()[start:end, :]  # q_grad torch.Size([16, 16]), down_grad torch.Size([16, 32])
+    start, end = tp_rank * tp_int_dim, (tp_rank + 1) * tp_int_dim
     down_grad_m = queue.get()[:, start:end]
-    print(f'Result@{tp_rank}: q_grad {q_grad_m.shape}, down_grad {down_grad_m.shape}')
-    print(f'Difference between output@{tp_rank}:', (y_0 - y_0_m).abs().sum())
-    print(f'Difference between Q grad@{tp_rank}:', (layer.attn.q_proj.weight.grad - q_grad_m).abs().sum())
-    print(f'Difference between Down grad@{tp_rank}:', (layer.mlp.down_proj.weight.grad - down_grad_m).abs().sum())
+
+    # print(f'Result@{tp_rank}: q_grad {q_grad_m.shape}, down_grad {down_grad_m.shape}')
+    print(f'Difference between attn output@{tp_rank}:', (y_attn - y_attn_m).abs().mean())
+    print(f'Difference between output@{tp_rank}:', (y_0 - y_0_m).abs().mean())
+    print(f'Difference between Q grad@{tp_rank}:', (layer.attn.q_proj.weight.grad - q_grad_m).abs().mean())
+    print(f'Difference between Down grad@{tp_rank}:', (layer.mlp.down_proj.weight.grad - down_grad_m).abs().mean())
+    print(f'tp_rank {tp_rank}: {y_0}')
 
 
 if __name__ == "__main__":
-    # import multiprocessing as mp
     import torch.multiprocessing as mp
 
-    @dataclass
-    class TestConfig:
-        hidden_size: int = 16
-        vocab_size: int = 128256
-        num_hidden_layers: int = 16
-        num_attention_heads: int = 8
-        num_key_value_heads: int = 2
-        intermediate_size: int = 16
-        pad_token_id: int = None
-        max_position_embeddings: int = 131072
-        rope_theta: float = 500000.0
-        rope_scaling: dict = field(
-            default_factory=lambda: {
-                "factor": 32.0,
-                "high_freq_factor": 4.0,
-                "low_freq_factor": 1.0,
-                "original_max_position_embeddings": 8192,
-                "rope_type": "llama3"
-            }
-        )
-        # partial_rotary_factor: float = 1.0
-        rms_norm_eps: float = 1e-05
+    # config = LlamaConfig(
+    #     hidden_size = 16,
+    #     num_attention_heads = 8,
+    #     num_key_value_heads = 2,
+    #     intermediate_size = 16,
+    # )
 
-    config = TestConfig()
+    config = LlamaConfig()
     hidden_size=config.hidden_size
     num_query_heads=config.num_attention_heads
     num_kv_heads=config.num_key_value_heads
     head_dim = hidden_size // num_query_heads
 
-    # attn = LlamaAttention(
-    #     layer_idx=0,
-    #     hidden_size=hidden_size,
-    #     num_query_heads=num_query_heads,
-    #     num_kv_heads=num_kv_heads,
-    # )
-    # mlp = LlamaMLP(
-    #     hidden_size=hidden_size,
-    #     intermediate_size=hidden_size * 2,
-    # )
-
     layer = LlamaDecoderLayer(
-        config=TestConfig(),
+        config=config,
         layer_idx=0,
+        tp_rank=0,
+        tp_size=1
     )
 
     qw = torch.randn(hidden_size, hidden_size, requires_grad=True)
     kw = torch.randn(head_dim * num_kv_heads, hidden_size, requires_grad=True)
     vw = torch.randn(head_dim * num_kv_heads, hidden_size, requires_grad=True)
     ow = torch.randn(hidden_size, hidden_size, requires_grad=True)
-    layer.attn.q_proj.weight = nn.Parameter(qw)
-    layer.attn.k_proj.weight = nn.Parameter(kw)
-    layer.attn.v_proj.weight = nn.Parameter(vw)
-    layer.attn.o_proj.weight = nn.Parameter(ow)
+    gate_w = torch.randn(config.intermediate_size, hidden_size, requires_grad=True)
+    up_w = torch.randn(config.intermediate_size, hidden_size, requires_grad=True)
+    down_w = torch.randn(hidden_size, config.intermediate_size, requires_grad=True)
 
-    gate_w = torch.randn(hidden_size * 2, hidden_size, requires_grad=True)
-    up_w = torch.randn(hidden_size * 2, hidden_size, requires_grad=True)
-    down_w = torch.randn(hidden_size, hidden_size * 2, requires_grad=True)
-    gate_up_w = torch.cat([gate_w, up_w], dim=0)
-    layer.mlp.gate_up_proj.weight = nn.Parameter(gate_up_w)
-    layer.mlp.down_proj.weight = nn.Parameter(down_w)
+    layer.load(
+        q_proj_w=qw,
+        k_proj_w=kw,
+        v_proj_w=vw,
+        o_proj_w=ow,
+        gate_w=gate_w,
+        up_w=up_w,
+        down_w=down_w,
+    )
 
     T, B = 6, 1
     x = torch.randn(B, T, hidden_size)
@@ -494,10 +478,9 @@ if __name__ == "__main__":
     pos_ids = torch.arange(T, dtype=torch.long).unsqueeze(0).expand(B, -1)
     pos_emb = rotary_emb(x, pos_ids)
 
-    # y_attn = attn(x, pos_emb)
-    # y_mlp = mlp(y_attn)
-    # print('Normal forward:', y_mlp)
+    y_attn = layer.attn(x, pos_emb)
     y_0 = layer(x, pos_emb)
+    print('Normal forward:', y_0)
     y = y_0.sum()
     y.backward()
 
@@ -513,14 +496,13 @@ if __name__ == "__main__":
     for w in workers:
         w.start()
 
+    y_attn = y_attn.detach().share_memory_()
     y_0 = y_0.detach().share_memory_()
-    # y_attn = y_attn.detach().share_memory_()
-    # y_mlp = y_mlp.detach().share_memory_()
     q_grad = layer.attn.q_proj.weight.grad.detach().share_memory_()
-    # gate_up_grad = mlp.gate_up_proj.weight.grad.detach().share_memory_()
     down_grad = layer.mlp.down_proj.weight.grad.detach().share_memory_()
 
     for q in queues:
+        q.put(y_attn)
         q.put(y_0)
         q.put(q_grad)
         q.put(down_grad)

@@ -9,6 +9,8 @@ dependencies = [
     "fastapi[standard]==0.128.0",
     "ipywidgets==8.1.8",
     "ray[default]==2.53.0",
+    "safetensors",
     "torch==2.9.1",
     "torchvision==0.24.1",
+    "transformers==4.57.6",
 ]
