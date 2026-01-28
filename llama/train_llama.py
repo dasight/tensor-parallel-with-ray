@@ -1,4 +1,5 @@
 from datetime import timedelta
+import time
 import os, sys
 sys.path += ['/home/cdsw/.venv/lib/python3.12/site-packages', '/home/cdsw/llama']
 
@@ -12,7 +13,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from llama import LlamaConfig, LlamaModel
 
-tp_size = 2
+tp_size = 4
 model_path = "/home/cdsw/models/Llama-3.2-1B-Instruct"
 data_path = "/home/cdsw/llama/tiny-shakespeare.txt"
 ray_dir = '/home/cdsw/ray'
@@ -68,7 +69,7 @@ def init_dist_group(tp_rank, tp_size):
 
         os.environ['MASTER_ADDR'] = ip
         os.environ['MASTER_PORT'] = "23333"
-        dist.init_process_group(backend='gloo', init_method='env://', world_size=tp_size, rank=tp_rank)
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=tp_size, rank=tp_rank)
         print(f"TP Rank {tp_rank} initialized.")
     else:
         print(f"Start to Initialize TP Rank {tp_rank} ...")
@@ -83,7 +84,7 @@ def init_dist_group(tp_rank, tp_size):
             os.environ['MASTER_ADDR'] = ip
             os.environ['MASTER_PORT'] = "23333"
             timeout = timedelta(seconds=10)
-            dist.init_process_group(backend='gloo', init_method='env://', world_size=tp_size, rank=tp_rank, timeout=timeout)
+            dist.init_process_group(backend='nccl', init_method='env://', world_size=tp_size, rank=tp_rank, timeout=timeout)
             if dist.is_initialized():
                 print(f"TP Rank {tp_rank} initialized.")
                 break
@@ -99,23 +100,32 @@ def train(tp_rank, tp_size, device='cpu'):
     load_embed(model, f"{model_path}/model.safetensors")
     model.to(device)
 
-    B, T = 4, 512
+    B, T = 4, 1024
     data_loader = DataLoaderLite(model_path, data_path, B, T)
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=True)
 
     for step in range(20):
+        t0 = time.time()
         optim.zero_grad()
-
+        
         x, y = data_loader.next_batch()
         x, y = x.cuda(), y.cuda()
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(B*T, -1), y.view(-1))        
+
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(B*T, -1), y.view(-1))
+        
         loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
         optim.step()
-        print(f"tp_rank {tp_rank} step {step} loss {loss.item()}")
+        torch.cuda.synchronize()
+
+        if tp_rank == 0:
+            dt = (time.time() - t0) * 1000
+            print(f"tp_rank {tp_rank} step {step}: loss {loss.item():.4f}, dt {dt:.2f}ms")
 
 
 if __name__ == "__main__":
-    tp_size = 2
     workers = [train.remote(tp_rank, tp_size, 'cuda') for tp_rank in range(tp_size)]
     ray.get(workers)
