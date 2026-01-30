@@ -14,14 +14,38 @@ from linear import RowParallelLinear, ColumnParallelLinear, AvgGrad
 torch.manual_seed(42)
 
 
+# @dataclass
+# class LlamaConfig:
+#     hidden_size: int = 2048  # Llama 3-1b
+#     vocab_size: int = 128256
+#     num_hidden_layers: int = 16
+#     num_attention_heads: int = 32
+#     num_key_value_heads: int = 8
+#     intermediate_size: int = 8192
+#     pad_token_id: int = None
+#     max_position_embeddings: int = 131072
+#     rope_theta: float = 500000.0
+#     rope_scaling: dict = field(
+#         default_factory=lambda: {
+#             "factor": 32.0,
+#             "high_freq_factor": 4.0,
+#             "low_freq_factor": 1.0,
+#             "original_max_position_embeddings": 8192,
+#             "rope_type": "llama3"
+#         }
+#     )
+#     # partial_rotary_factor: float = 1.0
+#     rms_norm_eps: float = 1e-05
+
+
 @dataclass
 class LlamaConfig:
-    hidden_size: int = 2048
+    hidden_size: int = 4096  # Llama 3-8b
     vocab_size: int = 128256
     num_hidden_layers: int = 16
     num_attention_heads: int = 32
     num_key_value_heads: int = 8
-    intermediate_size: int = 8192
+    intermediate_size: int = 14336
     pad_token_id: int = None
     max_position_embeddings: int = 131072
     rope_theta: float = 500000.0

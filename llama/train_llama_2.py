@@ -1,7 +1,7 @@
 from datetime import timedelta
 import time
 import os, sys
-sys.path += ['/home/cdsw/.venv/lib/python3.12/site-packages', '/home/cdsw/llama']
+# sys.path += ['/home/cdsw/.venv/lib/python3.12/site-packages', '/home/cdsw/llama']
 
 import safetensors
 import ray
@@ -13,15 +13,17 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from llama import LlamaConfig, LlamaModel
 
-tp_size = 2
-model_path = "/home/cdsw/models/Llama-3.2-1B-Instruct"
+tp_size = 1
+B, T = 1, 512
+# model_path = "/home/cdsw/models/Llama-3.2-1B-Instruct"
+model_path = "/home/cdsw/models/Llama-3.1-8B-Instruct"
 data_path = "/home/cdsw/llama/tiny-shakespeare.txt"
 ray_dir = '/home/cdsw/ray'
 
-with open(f'{ray_dir}/ray_current_cluster') as f:
-    ray_head_addr = f.read().split(':')[0]
-ray.init(f'ray://{ray_head_addr}:10001', runtime_env={"working_dir": "/home/cdsw/llama"})
-
+# with open(f'{ray_dir}/ray_current_cluster') as f:
+#     ray_head_addr = f.read().split(':')[0]
+# ray.init(f'ray://{ray_head_addr}:10001', runtime_env={"working_dir": "/home/cdsw/llama"})
+ray.init()
 
 class DataLoaderLite:
     def __init__(self, model_path, filename, BATCH_SIZE, SEQ_LEN):
@@ -55,12 +57,12 @@ def load_embed(model, safetensors_file):
         embed_weight = f.get_tensor(f'model.embed_tokens.weight').to(torch.float)
         embed_weight.requires_grad = False
         model.embed_tokens.weight = nn.Parameter(embed_weight)
-        model.embed_tokens.requires_grad = False
+        # model.embed_tokens.requires_grad = False
         model.lm_head.weight = nn.Parameter(embed_weight)
-        model.lm_head.requires_grad = False
+        # model.lm_head.requires_grad = False
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_cpus=8, num_gpus=1)
 class RayTrainer:
     def __init__(self, tp_rank, tp_size):
         self.tp_rank = tp_rank
@@ -81,10 +83,9 @@ class RayTrainer:
     def train(self, device):
         config = LlamaConfig(num_hidden_layers=2)
         model = LlamaModel(config, device=device, tp_rank=self.tp_rank, tp_size=self.tp_size)
-        load_embed(model, f"{model_path}/model.safetensors")
+        load_embed(model, f"{model_path}/model-00001-of-00004.safetensors")
         model.to(device)
     
-        B, T = 4, 1024
         data_loader = DataLoaderLite(model_path, data_path, B, T)
         optim = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=True)
     
@@ -112,6 +113,17 @@ class RayTrainer:
 
 if __name__ == "__main__":
     workers = [RayTrainer.remote(tp_rank=tp_rank, tp_size=tp_size) for tp_rank in range(tp_size)]
-    master_addr = ray.get(workers[0].master_addr.remote())
+    # master_addr = ray.get(workers[0].master_addr.remote())
+    master_addr = '127.0.0.1'
     ray.get([w.init_dist_group.remote(master_addr) for w in workers])
     ray.get([w.train.remote('cuda') for w in workers])
+
+
+# Llama 3-1b
+# tp_size = 2, (B, T) = (4, 512), dt = 252.91ms
+# tp_size = 4, (B, T) = (4, 1024), dt = 401.06ms
+
+# Llama 3-8b
+# tp_size = 1, (B, T) = (2, 512), dt = ms
+# tp_size = 2, (B, T) = (4, 512), dt = 550.49ms
+# tp_size = 4, (B, T) = (4, 1024), dt = 725.07ms
